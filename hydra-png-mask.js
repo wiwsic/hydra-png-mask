@@ -1,27 +1,23 @@
-// hydra-png-mask.js  —  PNG Mask v3 (isolado, sem MIDI)
-// Mantém: loadPngMask(url,name), useMask(name), maskShape(name,size,hardEdge), window.masks
+// hydra-png-mask.js — PNG Mask v4 with Aspect Ratio Support
+// API: loadPngMask(url,name), useMask(name), maskShape(name,size,hardEdge,preserveAspect), maskShapeAspect(name,size,hardEdge,fitMode)
 
 ;(function () {
   const g = (typeof window !== 'undefined') ? window : globalThis
 
-  // === Checagens de Hydra ===
   function ensureHydra() {
     if (!(g.src && g.osc && g.shape)) {
-      throw new Error('Hydra não detectado. Inicialize hydra-synth antes de usar as máscaras.')
+      throw new Error('Hydra not detected. Initialize hydra-synth before using PNG masks.')
     }
     ;['s0','s1','s2','s3'].forEach(k=>{
-      if (!g[k]) throw new Error(`Buffer ${k} ausente. Certifique-se de que Hydra criou s0..s3.`)
+      if (!g[k]) throw new Error(`Buffer ${k} missing. Ensure Hydra created s0..s3.`)
     })
   }
 
-  // === Store global de máscaras (canvas processado) ===
   const masks = new Map()
-  g.masks = masks  // compat: expõe globalmente
+  g.masks = masks
 
-  // === Utils ===
   function clamp01(x){ return Math.max(0, Math.min(1, x)) }
 
-  // Carrega Image com fallback via fetch->blob (evita problemas de CORS em alguns hosts)
   function loadImageAny(url){
     return new Promise((resolve,reject)=>{
       const tryDirect = () => {
@@ -49,7 +45,6 @@
     })
   }
 
-  // Converte PNG: alpha -> grayscale (RGB), alpha final = 255
   function alphaToGrayCanvas(img){
     const canvas = document.createElement('canvas')
     const ctx = canvas.getContext('2d')
@@ -66,7 +61,6 @@
     return canvas
   }
 
-  // Aplica threshold binário em RGB (alpha permanece 255)
   function thresholdCanvas(srcCanvas, hardEdge){
     const hard = clamp01(hardEdge||0)
     if (hard <= 0) return srcCanvas
@@ -77,17 +71,16 @@
     ctx.drawImage(srcCanvas,0,0)
     const imageData = ctx.getImageData(0,0,canvas.width,canvas.height)
     const data = imageData.data
-    const th = 128 * (1 - hard) // quanto maior hard, menor o threshold
+    const th = 128 * (1 - hard)
     for (let i=0;i<data.length;i+=4){
       const L = data[i]
       const v = (L > th) ? 255 : 0
-      data[i]=v; data[i+1]=v; data[i+2]=v // alpha fica 255
+      data[i]=v; data[i+1]=v; data[i+2]=v
     }
     ctx.putImageData(imageData,0,0)
     return canvas
   }
 
-  // Centraliza e escala dentro de fundo preto p/ size<1 (evita cortar)
   function centerScaleCanvas(srcCanvas, size){
     if (size >= 0.99 && size <= 1.01) return srcCanvas
     const canvas = document.createElement('canvas')
@@ -106,6 +99,97 @@
     return canvas
   }
 
+  function processCanvasWithAspect(srcCanvas, size, hardEdge, preserveAspect, fitMode = 'contain'){
+    const originalWidth = srcCanvas.width
+    const originalHeight = srcCanvas.height
+    const aspectRatio = originalWidth / originalHeight
+    
+    const workCanvas = document.createElement('canvas')
+    const ctx = workCanvas.getContext('2d')
+    const outputSize = Math.max(originalWidth, originalHeight, 1024)
+    workCanvas.width = outputSize
+    workCanvas.height = outputSize
+    
+    ctx.fillStyle = 'black'
+    ctx.fillRect(0, 0, workCanvas.width, workCanvas.height)
+    
+    let drawWidth, drawHeight, x, y
+    
+    if (!preserveAspect) {
+      if (size < 0.9) {
+        const scaledWidth = outputSize * size
+        const scaledHeight = outputSize * size
+        x = (outputSize - scaledWidth) / 2
+        y = (outputSize - scaledHeight) / 2
+        ctx.drawImage(srcCanvas, x, y, scaledWidth, scaledHeight)
+      } else {
+        ctx.drawImage(srcCanvas, 0, 0, outputSize, outputSize)
+      }
+    } else {
+      switch(fitMode) {
+        case 'contain':
+          if (aspectRatio > 1) {
+            drawWidth = outputSize * size
+            drawHeight = (outputSize * size) / aspectRatio
+          } else {
+            drawHeight = outputSize * size
+            drawWidth = (outputSize * size) * aspectRatio
+          }
+          break
+          
+        case 'cover':
+          if (aspectRatio > 1) {
+            drawHeight = outputSize * size
+            drawWidth = (outputSize * size) * aspectRatio
+          } else {
+            drawWidth = outputSize * size
+            drawHeight = (outputSize * size) / aspectRatio
+          }
+          break
+          
+        case 'stretch':
+          drawWidth = outputSize * size
+          drawHeight = outputSize * size
+          break
+          
+        default:
+          if (aspectRatio > 1) {
+            drawWidth = outputSize * size
+            drawHeight = (outputSize * size) / aspectRatio
+          } else {
+            drawHeight = outputSize * size
+            drawWidth = (outputSize * size) * aspectRatio
+          }
+      }
+      
+      x = (outputSize - drawWidth) / 2
+      y = (outputSize - drawHeight) / 2
+      
+      ctx.imageSmoothingEnabled = true
+      ctx.imageSmoothingQuality = 'high'
+      ctx.drawImage(srcCanvas, x, y, drawWidth, drawHeight)
+    }
+    
+    if (hardEdge > 0) {
+      const imageData = ctx.getImageData(0, 0, workCanvas.width, workCanvas.height)
+      const data = imageData.data
+      const threshold = 128 * (1 - hardEdge)
+      
+      for (let i = 0; i < data.length; i += 4) {
+        const luminance = data[i]
+        const newValue = luminance > threshold ? 255 : 0
+        
+        data[i] = newValue
+        data[i + 1] = newValue
+        data[i + 2] = newValue
+      }
+      
+      ctx.putImageData(imageData, 0, 0)
+    }
+    
+    return workCanvas
+  }
+
   function bufferRef(buf){
     if (typeof buf === 'number') return g[`s${buf}`]
     if (typeof buf === 'string') return g[buf]
@@ -114,29 +198,22 @@
 
   function renderToBuffer(canvas, buf){
     if (!buf || typeof buf.initImage !== 'function') {
-      throw new Error('Buffer Hydra inválido ao aplicar máscara (esperado s0..s3).')
+      throw new Error('Invalid Hydra buffer for mask rendering (expected s0..s3).')
     }
-    // usar dataURL garante portabilidade
     buf.initImage(canvas.toDataURL())
     return buf
   }
 
-  // ============ API ============
-
-  // Carrega UMA máscara e guarda processada (alpha->gray)
   async function loadPngMask(url, name){
     ensureHydra()
-    if (!url || !name) throw new Error('loadPngMask(url, name) requer ambos os parâmetros.')
+    if (!url || !name) throw new Error('loadPngMask(url, name) requires both parameters.')
     const img = await loadImageAny(url)
     const processed = alphaToGrayCanvas(img)
-    // opcionalmente manter invisível no DOM para debug:
-    // processed.style.display='none'; document.body.appendChild(processed)
     masks.set(name, processed)
-    console.log(`🎭 PNG mask carregada: ${name} (${processed.width}x${processed.height})`)
+    console.log(`🎭 PNG mask loaded: ${name} (${processed.width}x${processed.height})`)
     return name
   }
 
-  // Carrega várias (obj ou array de pares)
   async function loadPngMasks(defs){
     const entries = Array.isArray(defs) ? defs : Object.entries(defs||{})
     const out = []
@@ -144,52 +221,61 @@
     return Promise.all(out)
   }
 
-  // Devolve src(buffer) da máscara sem transform (compat com seu useMask)
   function useMask(name, opts={}){
     ensureHydra()
     const base = masks.get(name)
-    if (!base) throw new Error(`Máscara não encontrada: ${name}`)
+    if (!base) throw new Error(`Mask not found: ${name}`)
     const { buffer='s2' } = opts
     const buf = bufferRef(buffer)
     renderToBuffer(base, buf)
     return g.src(buf)
   }
 
-  // Igual ao seu maskShape(name,size,hardEdge):
-  // - size < ~0.9: re-render centralizado em fundo preto
-  // - hardEdge > 0: threshold binário
-  // - size >= 1: aplica no canvas base e retorna src(buf).scale(size)
-  function maskShape(name, size=1, hardEdge=0, opts={}){
+  function maskShape(name, size=1, hardEdge=0, preserveAspect=false, opts={}){
     ensureHydra()
     const base = masks.get(name)
-    if (!base) throw new Error(`Máscara não encontrada: ${name}`)
+    if (!base) throw new Error(`Mask not found: ${name}`)
     const { buffer='s3' } = opts
     const buf = bufferRef(buffer)
 
-    if (size < 0.9){
+    if (!preserveAspect && size < 0.9){
       const scaled = centerScaleCanvas(base, size)
       const th = thresholdCanvas(scaled, hardEdge)
       renderToBuffer(th, buf)
-      return g.src(buf) // já centralizado
-    } else {
-      // Para >=1, mantém canvas base (com threshold), e usa .scale no Hydra
+      return g.src(buf)
+    } else if (!preserveAspect && size >= 0.9) {
       const tmp = thresholdCanvas(base, hardEdge)
       renderToBuffer(tmp, buf)
       return g.src(buf).scale(size)
+    } else {
+      const processed = processCanvasWithAspect(base, size, hardEdge, preserveAspect, 'contain')
+      renderToBuffer(processed, buf)
+      return g.src(buf)
     }
   }
 
-  // helpers extras
+  function maskShapeAspect(name, size=1, hardEdge=0, fitMode='contain', opts={}){
+    ensureHydra()
+    const base = masks.get(name)
+    if (!base) throw new Error(`Mask not found: ${name}`)
+    const { buffer='s3' } = opts
+    const buf = bufferRef(buffer)
+
+    const processed = processCanvasWithAspect(base, size, hardEdge, true, fitMode)
+    renderToBuffer(processed, buf)
+    return g.src(buf)
+  }
+
   function listMasks(){ return Array.from(masks.keys()) }
-  function reloadPngMask(name, url){ return loadPngMask(url, name) } // mesmo nome = substitui
+  function reloadPngMask(name, url){ return loadPngMask(url, name) }
 
-  // Expor API global preservando nomes originais
-  g.loadPngMask  = loadPngMask
-  g.loadPngMasks = loadPngMasks
-  g.useMask      = useMask
-  g.maskShape    = maskShape
-  g.listMasks    = listMasks
-  g.reloadPngMask= reloadPngMask
+  g.loadPngMask     = loadPngMask
+  g.loadPngMasks    = loadPngMasks
+  g.useMask         = useMask
+  g.maskShape       = maskShape
+  g.maskShapeAspect = maskShapeAspect
+  g.listMasks       = listMasks
+  g.reloadPngMask   = reloadPngMask
 
-  console.log('🎭 PNG Mask v3 (isolado) carregado!')
+  console.log('🎭 PNG Mask v4 with Aspect Ratio support loaded!')
 })()
